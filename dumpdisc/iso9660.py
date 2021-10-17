@@ -34,14 +34,14 @@ import struct
 from . import common
 
 
-def _to_string(buffer):
-	return buffer.decode("ascii").strip()
+def _to_string(buffer, encoding):
+	return buffer.rstrip(b"\x00").decode(encoding).strip()
 
 def _parse_date_time(data):
 	if len(data) != 17:
 		raise ValueError("datetime data size incorrect")
 	
-	return datetime.datetime.strptime(_to_string(data[:14]), "%Y%m%d%H%M%S")
+	return datetime.datetime.strptime(_to_string(data[:14], "ascii"), "%Y%m%d%H%M%S")
 
 def _unpack(format, data):
 	result = ()
@@ -150,11 +150,11 @@ class BootRecordVolumeDescriptor(VolumeDescriptor):
 			self._TAB * indent + "- Boot Identifier: " + repr(self._boot_identifier) + "\n" + \
 			self._TAB * indent + "- Custom: " + self._custom.hex() + "\n"
 
-class PrimaryVolumeDescriptor(VolumeDescriptor, common.Partition):
-	def __init__(self, _type, identifier, version, data, image):
-		super().__init__(_type, identifier, version, data, image)
+class PartitionVolumeDescriptor(common.Partition):
+	def __init__(self, identifier, version, data, image):
+		self._image = image
 		
-		unused1, system_identifier, volume_identifier, unused2, self._volume_space_size, volume_space_size_msb, unused3, \
+		volume_flags, system_identifier, volume_identifier, unused1, self._volume_space_size, volume_space_size_msb, self._escape_sequences, \
 			self._volume_set_size, volume_set_size_msb, self._volume_sequence_number, volume_sequence_number_msb, \
 			self._logical_block_size, logical_block_size_msb, self._path_table_size, path_table_size_msb, \
 			type_l_path_table_location, type_l_optional_path_table_location, type_m_path_table_location, type_m_optional_path_table_location, \
@@ -163,29 +163,29 @@ class PrimaryVolumeDescriptor(VolumeDescriptor, common.Partition):
 			volume_creation_datetime, volume_modification_datetime, volume_expiration_datetime, volume_effective_datetime, \
 			file_structure_version, unused4, self._application_data, self._reserved = \
 			_unpack("B32s32s8s<I>I32s<H>H<H>H<H>H<I>I<I<I>I>I34s128s128s128s128s37s37s37s17s17s17s17sBB512s653s", data)
-		self._custom_data = data[64:]
 		
-		if self._identifier != b"CD001":
-			raise ValueError("invalid identifier for primary volume descriptor ({})".format(self._identifier))
+		if identifier != b"CD001":
+			raise ValueError("invalid identifier for primary/secondary volume descriptor")
 			
-		if self._version != 1:
-			raise ValueError("invalid version for primary volume descriptor")
+		if version != 1:
+			raise ValueError("invalid version for primary/secondary volume descriptor")
 			
-		self._system_identifier = _to_string(system_identifier)
-		self._volume_identifier = _to_string(volume_identifier)
+		if volume_flags == 0x00:
+			self._additional_escape_sequences = False
+		elif volume_flags == 0x01:
+			self._additional_escape_sequences = True
+		else:
+			raise ValueError("invalid volume flags for primary/secondary volume descriptor ({})".format(volume_flags))
 		
-		if unused1 != 0:
-			raise ValueError("invalid unused1 for primary volume descriptor")
-			
-		if unused2 != b"\x00" * 8:
-			raise ValueError("invalid unused2 for primary volume descriptor ({})".format(unused2))
+		self._system_identifier = _to_string(system_identifier, self.encoding)
+		self._volume_identifier = _to_string(volume_identifier, self.encoding)
+
+		if unused1 != b"\x00" * 8:
+			raise ValueError("invalid unused1 for primary/secondary volume descriptor ({})".format(unused1))
 		
 		if self._volume_space_size != volume_space_size_msb:
 			raise ValueError("volume space size fields do not match for primary volume descriptor")
 		
-		if unused3 != b"\x00" * 32:
-			raise ValueError("invalid unused3 for primary volume descriptor")
-
 		if self._volume_set_size != volume_set_size_msb:
 			raise ValueError("volume set size fields do not match for primary volume descriptor")
 
@@ -201,16 +201,16 @@ class PrimaryVolumeDescriptor(VolumeDescriptor, common.Partition):
 		self._type_l_path_table = self._read_path_table(True, type_l_path_table_location, self._path_table_size)
 		self._type_m_path_table = self._read_path_table(False, type_m_path_table_location, self._path_table_size)
 			
-		self._root_directory_record = DirectoryRecord(root_directory_entry)
+		self._root_directory_record = DirectoryRecord(root_directory_entry, self.encoding)
 			
-		self._volume_set_identifier = _to_string(volume_set_identifier)
-		self._publisher_identifier = _to_string(publisher_identifier)
-		self._data_preparer_identifier = _to_string(data_preparer_identifier)
-		self._application_identifier = _to_string(application_identifier)
-		self._data_preparer_identifier = _to_string(data_preparer_identifier)
-		self._copyright_file_identifier = _to_string(copyright_file_identifier)
-		self._abstract_file_identifier = _to_string(abstract_file_identifier)
-		self._bibliographic_file_identifier = _to_string(bibliographic_file_identifier)
+		self._volume_set_identifier = _to_string(volume_set_identifier, self.encoding)
+		self._publisher_identifier = _to_string(publisher_identifier, self.encoding)
+		self._data_preparer_identifier = _to_string(data_preparer_identifier, self.encoding)
+		self._application_identifier = _to_string(application_identifier, self.encoding)
+		self._data_preparer_identifier = _to_string(data_preparer_identifier, self.encoding)
+		self._copyright_file_identifier = _to_string(copyright_file_identifier, self.encoding)
+		self._abstract_file_identifier = _to_string(abstract_file_identifier, self.encoding)
+		self._bibliographic_file_identifier = _to_string(bibliographic_file_identifier, self.encoding)
 
 		self._volume_create_date = _parse_date_time(volume_creation_datetime)
 		self._volume_modification_date = _parse_date_time(volume_modification_datetime)
@@ -229,22 +229,18 @@ class PrimaryVolumeDescriptor(VolumeDescriptor, common.Partition):
 		if unused4 != 0:
 			raise ValueError("invalid unused4 for primary volume descriptor")
 			
+	@property
+	def encoding(self):
+		raise NotImplementedError
+
 	def _read_path_table(self, lsb, location, size):
 		data = self._image.read_extent(location, size)
 		path_table = []
 		while len(data) > 0 and data[0] > 0:
-			entry = PathTableEntry(lsb, data)
+			entry = PathTableEntry(lsb, data, self.encoding)
 			path_table.append(entry)
 			data = data[8 + entry._identifier_length + (entry._identifier_length & 0x01):]
 		return path_table
-		
-	@classmethod
-	def get_type(cls):
-		return 1
-		
-	@property
-	def type(self):
-		return "iso9660"
 
 	@property
 	def label(self):
@@ -255,7 +251,7 @@ class PrimaryVolumeDescriptor(VolumeDescriptor, common.Partition):
 		return Directory(self._root_directory_record, self._image)
 		
 	def dump(self, indent=0):
-		return self._TAB * indent + "PrimaryVolumeDescriptor:\n" + \
+		return self._TAB * indent + "{} ({}):\n".format(self.__class__.__name__, self.type) + \
 			self._TAB * indent + "- System Identifier: {}\n".format(repr(self._system_identifier)) + \
 			self._TAB * indent + "- Volume Identifier: {}\n".format(repr(self._volume_identifier)) + \
 			self._TAB * indent + "- Volume Space Size: {} blocks\n".format(self._volume_space_size) + \
@@ -282,13 +278,57 @@ class PrimaryVolumeDescriptor(VolumeDescriptor, common.Partition):
 			self._TAB * indent + "- Volume Expiration: {}\n".format(self._volume_expiration_date.isoformat() if self._volume_expiration_date != None else "not specified") + \
 			self._TAB * indent + "- Volume Effective: {}\n".format(self._volume_effective_date.isoformat() if self._volume_effective_date != None else "not specified")
 
-class SupplementaryVolumeDescriptor(VolumeDescriptor):
+class PrimaryVolumeDescriptor(VolumeDescriptor, PartitionVolumeDescriptor):
+	def __init__(self, _type, identifier, version, data, image):
+		VolumeDescriptor.__init__(self, _type, identifier, version, data, image)
+		PartitionVolumeDescriptor.__init__(self, identifier, version, data, image)
+
+		if self._additional_escape_sequences:
+			raise ValueError("invalid volume flags for primary volume descriptor")
+
+		if self._escape_sequences != b"\x00" * 32:
+			raise ValueError("invalid escape sequences for primary volume descriptor")
+
+	@classmethod
+	def get_type(cls):
+		return 1
+
+	@property
+	def encoding(self):
+		return "ascii"
+
+	@property
+	def type(self):
+		return "iso9660"
+
+	def dump(self, indent=0):
+		return PartitionVolumeDescriptor.dump(self, indent)
+
+class SupplementaryVolumeDescriptor(VolumeDescriptor, PartitionVolumeDescriptor):
+	def __init__(self, _type, identifier, version, data, image):
+		VolumeDescriptor.__init__(self, _type, identifier, version, data, image)
+		PartitionVolumeDescriptor.__init__(self, identifier, version, data, image)
+
+		if self._additional_escape_sequences:
+			raise ValueError("additional escape sequences for secondary volume descriptor are not supported")
+
+		if self._escape_sequences not in (b"\x25\x2f\x40".ljust(32, b"\x00"), b"\x25\x2f\x43".ljust(32, b"\x00"), b"\x25\x2f\x45".ljust(32, b"\x00")):
+			raise ValueError("not supported escape sequences for secondary volume descriptor")
+
 	@classmethod
 	def get_type(cls):
 		return 2
-		
+
+	@property
+	def encoding(self):
+		return "utf-16_be"
+
+	@property
+	def type(self):
+		return "joliet"
+
 	def dump(self, indent=0):
-		return self._TAB * indent + "SupplementaryVolumeDescriptor"
+		return PartitionVolumeDescriptor.dump(self, indent)
 
 class VolumePartitionDescriptor(VolumeDescriptor):
 	@classmethod
@@ -307,11 +347,11 @@ class VolumeDescriptorSetTerminator(VolumeDescriptor):
 		return self._TAB * indent + "VolumeDescriptorSetTerminator"
 
 class PathTableEntry(common.Dumpeable):
-	def __init__(self, lsb, data):
+	def __init__(self, lsb, data, encoding):
 		endianness = "<" if lsb else ">"
 		self._identifier_length, extended_attributes_length, self._extent, self._parent_index = _unpack(endianness + "BBIH", data[:8])
 		
-		self._identifier = data[8:8 + self._identifier_length]
+		self._identifier = _to_string(data[8:8 + self._identifier_length], encoding)
 		
 	def dump(self, indent=0):
 		return self._TAB * indent + "PathTableEntry:\n" + \
@@ -320,12 +360,13 @@ class PathTableEntry(common.Dumpeable):
 			self._TAB * indent + "- Parent Directory Index: {}".format(self._parent_index)
 			
 # TODO: merge different versions of the same file in a single instance and manage them through streams
-class DirectoryRecord(common.Directory, common.File, common.Dumpeable):
-	def __init__(self, data):
+class DirectoryRecord(common.Dumpeable):
+	def __init__(self, data, encoding):
 		self._length, self._extended_attributes_length, self._extent, extent_msb, self._data_length, data_length_msb, \
-		recording_datetime_year, recording_datetime_month, recording_datetime_day, recording_datetime_hours, recording_datetime_minutes, recording_datetime_seconds, recording_datetime_tz, \
-		flags, self._file_unit_size, self._interleave_gap_size, self._volume_sequence_number, volume_sequence_number_msb, self._file_indentifier_length = \
-		_unpack("BB<I>I<I>IBBBBBBBBBB<H>HB", data[:33])
+			recording_datetime_year, recording_datetime_month, recording_datetime_day, recording_datetime_hours, recording_datetime_minutes, recording_datetime_seconds, recording_datetime_tz, \
+			flags, self._file_unit_size, self._interleave_gap_size, self._volume_sequence_number, volume_sequence_number_msb, self._file_indentifier_length = \
+			_unpack("BB<I>I<I>IBBBBBBBBBB<H>HB", data[:33])
+		self._encoding = encoding
 		
 		self._identifier = data[33:33 + self._file_indentifier_length]
 		
@@ -355,7 +396,7 @@ class DirectoryRecord(common.Directory, common.File, common.Dumpeable):
 		
 	@property
 	def name(self):
-		return _to_string(self._identifier).split(";", 2)[0]
+		return _to_string(self._identifier.split(b";", 2)[0], self._encoding)
 	
 	@property
 	def is_directory(self):
@@ -372,25 +413,13 @@ class DirectoryRecord(common.Directory, common.File, common.Dumpeable):
 		data = data[data[0] + data[1]:]
 		# TODO: take into account directory records cannot cross block boundaries
 		while len(data) > 0 and data[0] > 0:
-			record = DirectoryRecord(data)
+			record = DirectoryRecord(data, self._encoding)
 			childs.append(record)
 			if record._is_final:
 				break
 			data = data[record._length + record._extended_attributes_length:]
 		
 		return childs
-	
-	@property
-	def files(self):
-		if not self._is_directory:
-			return tuple()
-		return tuple(filter(lambda entry: not entry._is_directory, self._entries))
-		
-	@property
-	def directories(self):
-		if not self._is_directory:
-			return tuple()
-		return tuple(filter(lambda entry: entry._is_directory, self._entries))
 		
 	def get_content(self, image, stream=0):
 		if self._is_directory:
@@ -410,7 +439,7 @@ class DirectoryRecord(common.Directory, common.File, common.Dumpeable):
 				
 	def dump(self, indent=0):
 		return self._TAB * indent + "DirectoryRecord:\n" + \
-			self._TAB * indent + "- Identifier: {}\n".format(self._identifier) + \
+			self._TAB * indent + "- Identifier: {}\n".format(self.name) + \
 			self._TAB * indent + "- Extent Location: {}\n".format(self._extent) + \
 			self._TAB * indent + "- Data Length: {}\n".format(self._data_length) + \
 			self._TAB * indent + "- Recorded: {}\n".format(self._recording_date_time.isoformat()) + \

@@ -107,7 +107,7 @@ class Partition(common.Dumpeable):
 		return self._volume.read_blocks(self._start_block + address, count)
 	
 	def dump(self, indent=0):
-		return self._TAB * indent + "{}:\n".format(self.__class__.__name__) + \
+		return self._TAB * indent + "{} ({}):\n".format(self.__class__.__name__, self.type) + \
 			self._TAB * indent + "- Partition Count: {}\n".format(self._partition_count) + \
 			self._TAB * indent + "- Start Block: {}\n".format(self._start_block) + \
 			self._TAB * indent + "- Block Count: {}\n".format(self._block_count) + \
